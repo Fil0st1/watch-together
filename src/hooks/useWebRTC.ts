@@ -18,9 +18,11 @@ interface UseWebRTCOptions {
 }
 
 // ICE servers (STUN only — free, no TURN needed for same-network / most cases)
+// Added Cloudflare STUN for better connection stability
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun.cloudflare.com:3478" },
 ];
 
 export function useWebRTC({
@@ -47,7 +49,11 @@ export function useWebRTC({
 
   const createPeerConnection = useCallback(
     (remotePeerId: string): RTCPeerConnection => {
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      // Prepare for SFU: bundlePolicy "max-bundle" multiplexes all tracks over a single transport
+      const pc = new RTCPeerConnection({
+        iceServers: ICE_SERVERS,
+        bundlePolicy: "max-bundle",
+      });
 
       pc.onicecandidate = (e) => {
         if (e.candidate) {
@@ -62,6 +68,10 @@ export function useWebRTC({
 
       pc.ontrack = (e) => {
         if (!isHost && e.streams[0]) {
+          // Reduce buffering: set playout delay hint to minimize latency over quality tradeoffs
+          if (e.receiver && "playoutDelayHint" in e.receiver) {
+            (e.receiver as any).playoutDelayHint = 0;
+          }
           onStreamReceived(e.streams[0]);
         }
       };
@@ -73,19 +83,43 @@ export function useWebRTC({
   );
 
   // Start sharing — called by host
-  const startSharing = useCallback(async (): Promise<MediaStream | null> => {
+  const startSharing = useCallback(async (customStream?: MediaStream): Promise<MediaStream | null> => {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30 } },
-        audio: true,
-      });
+      let stream = customStream;
+      if (!stream) {
+        // Configuration for high quality, high frame rate screen sharing.
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            // Prefer 60 FPS for smooth playback
+            frameRate: { ideal: 60, max: 60 },
+            // Prefer high resolution (1080p ideal)
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            // Hint to the browser we are sharing a monitor/screen
+            displaySurface: "monitor",
+          },
+          audio: {
+            // Disable filters that degrade system audio quality and clear up echo/voice optimizations
+            autoGainControl: false,
+            echoCancellation: false,
+            noiseSuppression: false,
+          },
+        });
+
+        // Handle cases where audio is missing gracefully
+        if (stream.getAudioTracks().length === 0) {
+          console.warn("No audio track found in display media stream. Viewers won't hear system audio.");
+        }
+      }
+
       localStreamRef.current = stream;
 
       // Send offer to all existing viewers by broadcasting
       sendSignal({ type: "host-started", from: peerId });
 
       return stream;
-    } catch {
+    } catch (err) {
+      console.error("Error getting display media:", err);
       return null;
     }
   }, [peerId, sendSignal]);
@@ -97,7 +131,22 @@ export function useWebRTC({
       const pc = createPeerConnection(viewerId);
 
       localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current!);
+        const sender = pc.addTrack(track, localStreamRef.current!);
+
+        // Optimize WebRTC for real-time streaming, not file quality
+        if (track.kind === "video") {
+          const params = sender.getParameters();
+          // degradationPreference controls how the browser reacts to poor network
+          // maintain-framerate prioritizes playback speed over perfect resolution
+          if (!params.degradationPreference) {
+            params.degradationPreference = "maintain-framerate";
+          }
+          try {
+            sender.setParameters(params);
+          } catch (e) {
+            console.warn("Could not set sender parameters", e);
+          }
+        }
       });
 
       const offer = await pc.createOffer();

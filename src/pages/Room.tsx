@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { MonitorPlay, MonitorX, Copy, Check } from "lucide-react";
+import { MonitorPlay, MonitorX, Copy, Check, Upload } from "lucide-react";
 import { useWebRTC } from "@/hooks/useWebRTC";
 
 // Generate a stable peer ID for this session
@@ -14,15 +14,17 @@ const Room = () => {
   const [isSharing, setIsSharing] = useState(false);
   const [hasStream, setHasStream] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [videoFileUrl, setVideoFileUrl] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const onStreamReceived = useCallback((stream: MediaStream) => {
     setHasStream(true);
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
-      videoRef.current.play().catch(() => {});
+      videoRef.current.play().catch(() => { });
     }
   }, []);
 
@@ -41,7 +43,28 @@ const Room = () => {
     onHostStopped,
   });
 
+  const handleStopShare = useCallback(() => {
+    stopSharing();
+    setIsSharing(false);
+    setHasStream(false);
+    setVideoFileUrl(null);
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
+      localVideoRef.current.src = "";
+      localVideoRef.current.controls = false;
+      localVideoRef.current.muted = true;
+    }
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, [stopSharing]);
+
   const handleStartShare = useCallback(async () => {
+    setVideoFileUrl(null);
+    if (localVideoRef.current) {
+      localVideoRef.current.src = "";
+      localVideoRef.current.controls = false;
+      localVideoRef.current.muted = true;
+    }
+
     const stream = await startSharing();
     if (!stream) return;
     setIsSharing(true);
@@ -49,21 +72,61 @@ const Room = () => {
 
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = stream;
-      localVideoRef.current.play().catch(() => {});
+      localVideoRef.current.play().catch(() => { });
     }
 
     // Handle user stopping via browser's stop-sharing button
-    stream.getVideoTracks()[0].onended = () => {
-      handleStopShare();
-    };
-  }, [startSharing]);
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      track.onended = () => {
+        handleStopShare();
+      };
+    }
+  }, [startSharing, handleStopShare]);
 
-  const handleStopShare = useCallback(() => {
-    stopSharing();
-    setIsSharing(false);
-    setHasStream(false);
-    if (localVideoRef.current) localVideoRef.current.srcObject = null;
-  }, [stopSharing]);
+  const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (isSharing) {
+      handleStopShare();
+    }
+
+    const url = URL.createObjectURL(file);
+    setVideoFileUrl(url);
+    setIsSharing(true);
+    setHasStream(true);
+
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
+      localVideoRef.current.src = url;
+      localVideoRef.current.controls = true;
+      localVideoRef.current.muted = false; // Admin needs to hear the video
+
+      localVideoRef.current.onloadeddata = async () => {
+        const videoElement = localVideoRef.current as any;
+        let stream: MediaStream | null = null;
+
+        if (typeof videoElement.captureStream === "function") {
+          stream = videoElement.captureStream();
+        } else if (typeof videoElement.mozCaptureStream === "function") {
+          stream = videoElement.mozCaptureStream();
+        }
+
+        if (stream) {
+          await startSharing(stream);
+          const track = stream.getVideoTracks()[0];
+          if (track) {
+            track.onended = () => {
+              handleStopShare();
+            };
+          }
+        }
+      };
+
+      localVideoRef.current.play().catch(() => { });
+    }
+  }, [startSharing, isSharing, handleStopShare]);
 
   const copyRoomId = useCallback(() => {
     navigator.clipboard.writeText(roomId!);
@@ -120,14 +183,30 @@ const Room = () => {
           {/* Admin controls */}
           {isHost && (
             <>
+              <input
+                type="file"
+                accept="video/mp4,video/webm,video/x-matroska,video/*"
+                ref={fileInputRef}
+                className="hidden"
+                onChange={handleFileUpload}
+              />
               {!isSharing ? (
-                <button
-                  onClick={handleStartShare}
-                  className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
-                >
-                  <MonitorPlay className="w-3.5 h-3.5" />
-                  Start Share
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-secondary text-secondary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    Upload Video
+                  </button>
+                  <button
+                    onClick={handleStartShare}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
+                  >
+                    <MonitorPlay className="w-3.5 h-3.5" />
+                    Start Share
+                  </button>
+                </div>
               ) : (
                 <button
                   onClick={handleStopShare}
