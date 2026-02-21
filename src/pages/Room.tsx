@@ -1,7 +1,8 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { MonitorPlay, MonitorX, Copy, Check, Upload } from "lucide-react";
+import { MonitorPlay, MonitorX, Copy, Check, Upload, FileVideo } from "lucide-react";
 import { useWebRTC } from "@/hooks/useWebRTC";
+import { supabase } from "@/integrations/supabase/client";
 
 // Generate a stable peer ID for this session
 const SESSION_PEER_ID = `peer_${Math.random().toString(36).slice(2, 10)}`;
@@ -16,14 +17,52 @@ const Room = () => {
   const [copied, setCopied] = useState(false);
   const [videoFileUrl, setVideoFileUrl] = useState<string | null>(null);
 
+  // Dual Media Mode
+  const [streamMode, setStreamMode] = useState<"screen" | "file">("screen");
+  const [isUploading, setIsUploading] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const syncIntervalRef = useRef<number | null>(null);
+  const onViewerReadyRef = useRef<(viewerId: string) => void>();
+
+  const handleControlReceived = useCallback((action: string, payload: any) => {
+    if (isHost) return; // Admin is source of truth
+
+    const vid = videoRef.current;
+    if (!vid) return;
+
+    if (action === "file-url") {
+      setStreamMode("file");
+      setVideoFileUrl(payload.url);
+      setHasStream(true);
+      if (vid.srcObject) vid.srcObject = null;
+      vid.src = payload.url;
+      vid.muted = false;
+      vid.controls = false;
+    } else if (action === "play") {
+      vid.play().catch(() => { });
+    } else if (action === "pause") {
+      vid.pause();
+    } else if (action === "seek") {
+      vid.currentTime = payload.time;
+    } else if (action === "sync") {
+      // Drift detection: resync if > 300ms drift
+      const adminTime = payload.time;
+      const drift = Math.abs(vid.currentTime - adminTime);
+      if (drift > 0.3 && !vid.paused) {
+        vid.currentTime = adminTime;
+      }
+    }
+  }, [isHost]);
 
   const onStreamReceived = useCallback((stream: MediaStream) => {
+    setStreamMode("screen");
     setHasStream(true);
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
+      videoRef.current.src = "";
       videoRef.current.play().catch(() => { });
     }
   }, []);
@@ -35,24 +74,45 @@ const Room = () => {
     }
   }, []);
 
-  const { startSharing, stopSharing } = useWebRTC({
+  const { startSharing, stopSharing, sendControlSignal } = useWebRTC({
     roomId: roomId!,
     peerId: SESSION_PEER_ID,
     isHost,
     onStreamReceived,
     onHostStopped,
+    onControlReceived: handleControlReceived,
+    onViewerReady: (vid) => onViewerReadyRef.current?.(vid),
   });
+
+  useEffect(() => {
+    onViewerReadyRef.current = (viewerId: string) => {
+      if (streamMode === "file" && isSharing && videoFileUrl) {
+        sendControlSignal("file-url", { url: videoFileUrl }, viewerId);
+        sendControlSignal("seek", { time: localVideoRef.current?.currentTime || 0 }, viewerId);
+        if (localVideoRef.current && !localVideoRef.current.paused) {
+          sendControlSignal("play", undefined, viewerId);
+        }
+      }
+    };
+  }, [streamMode, isSharing, videoFileUrl, sendControlSignal]);
 
   const handleStopShare = useCallback(() => {
     stopSharing();
     setIsSharing(false);
     setHasStream(false);
     setVideoFileUrl(null);
+    if (syncIntervalRef.current) {
+      window.clearInterval(syncIntervalRef.current);
+    }
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
       localVideoRef.current.src = "";
       localVideoRef.current.controls = false;
       localVideoRef.current.muted = true;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+      videoRef.current.src = "";
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, [stopSharing]);
@@ -92,41 +152,54 @@ const Room = () => {
       handleStopShare();
     }
 
-    const url = URL.createObjectURL(file);
-    setVideoFileUrl(url);
-    setIsSharing(true);
-    setHasStream(true);
+    try {
+      setIsUploading(true);
+      // Upload to supabase storage bucket "room-media"
+      const fileName = `${roomId}_${Date.now()}_${file.name}`;
+      const { data, error } = await supabase.storage.from("room-media").upload(fileName, file);
 
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = null;
-      localVideoRef.current.src = url;
-      localVideoRef.current.controls = true;
-      localVideoRef.current.muted = false; // Admin needs to hear the video
+      if (error) {
+        console.error("Upload failed", error);
+        setIsUploading(false);
+        return;
+      }
 
-      localVideoRef.current.onloadeddata = async () => {
-        const videoElement = localVideoRef.current as any;
-        let stream: MediaStream | null = null;
+      const { data: { publicUrl } } = supabase.storage.from("room-media").getPublicUrl(fileName);
 
-        if (typeof videoElement.captureStream === "function") {
-          stream = videoElement.captureStream();
-        } else if (typeof videoElement.mozCaptureStream === "function") {
-          stream = videoElement.mozCaptureStream();
-        }
+      setVideoFileUrl(publicUrl);
+      setIsSharing(true);
+      setHasStream(true);
 
-        if (stream) {
-          await startSharing(stream);
-          const track = stream.getVideoTracks()[0];
-          if (track) {
-            track.onended = () => {
-              handleStopShare();
-            };
+      // Notify viewers of the new file
+      sendControlSignal("file-url", { url: publicUrl });
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null;
+        localVideoRef.current.src = publicUrl;
+        localVideoRef.current.controls = true;
+        localVideoRef.current.muted = false;
+
+        // Bind control events for admin to emit
+        localVideoRef.current.onplay = () => sendControlSignal("play");
+        localVideoRef.current.onpause = () => sendControlSignal("pause");
+        localVideoRef.current.onseeked = () => sendControlSignal("seek", { time: localVideoRef.current?.currentTime });
+
+        // Start 5-second sync polling
+        if (syncIntervalRef.current) window.clearInterval(syncIntervalRef.current);
+        syncIntervalRef.current = window.setInterval(() => {
+          if (localVideoRef.current && !localVideoRef.current.paused) {
+            sendControlSignal("sync", { time: localVideoRef.current.currentTime });
           }
-        }
-      };
+        }, 5000);
 
-      localVideoRef.current.play().catch(() => { });
+        localVideoRef.current.play().catch(() => { });
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsUploading(false);
     }
-  }, [startSharing, isSharing, handleStopShare]);
+  }, [sendControlSignal, isSharing, handleStopShare, roomId]);
 
   const copyRoomId = useCallback(() => {
     navigator.clipboard.writeText(roomId!);
@@ -192,20 +265,39 @@ const Room = () => {
               />
               {!isSharing ? (
                 <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-secondary text-secondary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    Upload Video
-                  </button>
-                  <button
-                    onClick={handleStartShare}
-                    className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
-                  >
-                    <MonitorPlay className="w-3.5 h-3.5" />
-                    Start Share
-                  </button>
+                  <div className="bg-secondary p-1 rounded-md flex gap-1 mr-2">
+                    <button
+                      onClick={() => setStreamMode("screen")}
+                      className={`px-3 py-1 text-xs font-medium rounded-sm transition-colors ${streamMode === "screen" ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      Screen
+                    </button>
+                    <button
+                      onClick={() => setStreamMode("file")}
+                      className={`px-3 py-1 text-xs font-medium rounded-sm transition-colors ${streamMode === "file" ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      File
+                    </button>
+                  </div>
+
+                  {streamMode === "file" ? (
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isUploading}
+                      className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+                    >
+                      <FileVideo className="w-3.5 h-3.5" />
+                      {isUploading ? "Uploading..." : "Upload & Stream"}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={handleStartShare}
+                      className="flex items-center gap-2 px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
+                    >
+                      <MonitorPlay className="w-3.5 h-3.5" />
+                      Start Share
+                    </button>
+                  )}
                 </div>
               ) : (
                 <button

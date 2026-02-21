@@ -7,7 +7,8 @@ type SignalMessage =
   | { type: "ice-candidate"; candidate: RTCIceCandidateInit; from: string; to?: string }
   | { type: "host-stopped"; from: string; to?: string }
   | { type: "host-started"; from: string; to?: string }
-  | { type: "viewer-ready"; from: string; to?: string };
+  | { type: "viewer-ready"; from: string; to?: string }
+  | { type: "control"; action: "play" | "pause" | "seek" | "sync" | "file-url"; payload?: any; from: string; to?: string };
 
 interface UseWebRTCOptions {
   roomId: string;
@@ -15,6 +16,8 @@ interface UseWebRTCOptions {
   isHost: boolean;
   onStreamReceived: (stream: MediaStream) => void;
   onHostStopped: () => void;
+  onControlReceived?: (action: "play" | "pause" | "seek" | "sync" | "file-url", payload?: any) => void;
+  onViewerReady?: (viewerId: string) => void;
 }
 
 // ICE servers (STUN only — free, no TURN needed for same-network / most cases)
@@ -31,6 +34,8 @@ export function useWebRTC({
   isHost,
   onStreamReceived,
   onHostStopped,
+  onControlReceived,
+  onViewerReady,
 }: UseWebRTCOptions) {
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
@@ -45,6 +50,13 @@ export function useWebRTC({
       });
     },
     []
+  );
+
+  const sendControlSignal = useCallback(
+    (action: "play" | "pause" | "seek" | "sync" | "file-url", payload?: any, to?: string) => {
+      sendSignal({ type: "control", action, payload, from: peerId, to });
+    },
+    [peerId, sendSignal]
   );
 
   const createPeerConnection = useCallback(
@@ -90,11 +102,11 @@ export function useWebRTC({
         // Configuration for high quality, high frame rate screen sharing.
         stream = await navigator.mediaDevices.getDisplayMedia({
           video: {
-            // Prefer 60 FPS for smooth playback
-            frameRate: { ideal: 60, max: 60 },
-            // Prefer high resolution (1080p ideal)
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            // Prefer 30 FPS for stable streaming
+            frameRate: { ideal: 30, max: 30 },
+            // Cap resolution (1080p)
+            width: { max: 1920, ideal: 1280 },
+            height: { max: 1080, ideal: 720 },
             // Hint to the browser we are sharing a monitor/screen
             displaySurface: "monitor",
           },
@@ -141,10 +153,41 @@ export function useWebRTC({
           if (!params.degradationPreference) {
             params.degradationPreference = "maintain-framerate";
           }
+
+          // Cap bitrate (approx 4 Mbps max)
+          if (!params.encodings) {
+            params.encodings = [{}];
+          }
+          params.encodings[0].maxBitrate = 4000000;
+
           try {
             sender.setParameters(params);
           } catch (e) {
             console.warn("Could not set sender parameters", e);
+          }
+        }
+      });
+
+      // Prefer VP9 codec
+      const transceivers = pc.getTransceivers();
+      transceivers.forEach((t) => {
+        if (t.sender.track?.kind === "video" && typeof RTCRtpSender.getCapabilities !== "undefined") {
+          const capabilities = RTCRtpSender.getCapabilities("video");
+          if (capabilities && capabilities.codecs) {
+            const sortedCodecs = capabilities.codecs.sort((a, b) => {
+              const getScore = (mimeType: string) => {
+                if (mimeType.includes("VP9")) return 3;
+                if (mimeType.includes("VP8")) return 2;
+                if (mimeType.includes("H264")) return 1;
+                return 0;
+              };
+              return getScore(b.mimeType) - getScore(a.mimeType);
+            });
+            try {
+              t.setCodecPreferences(sortedCodecs);
+            } catch (e) {
+              console.warn("Could not set codec preferences", e);
+            }
           }
         }
       });
@@ -179,6 +222,7 @@ export function useWebRTC({
       }
 
       if (payload.type === "viewer-ready" && isHost) {
+        onViewerReady?.(payload.from);
         await sendOfferToViewer(payload.from);
         return;
       }
@@ -216,8 +260,13 @@ export function useWebRTC({
         peerConnections.current.clear();
         return;
       }
+
+      if (payload.type === "control" && !isHost) {
+        onControlReceived?.(payload.action, payload.payload);
+        return;
+      }
     },
-    [isHost, peerId, createPeerConnection, sendSignal, sendOfferToViewer, onHostStopped]
+    [isHost, peerId, createPeerConnection, sendSignal, sendOfferToViewer, onHostStopped, onControlReceived, onViewerReady]
   );
 
   // Setup Supabase Realtime channel for signaling
@@ -246,5 +295,5 @@ export function useWebRTC({
     };
   }, [roomId, isHost, peerId, handleSignal, sendSignal]);
 
-  return { startSharing, stopSharing, localStreamRef };
+  return { startSharing, stopSharing, localStreamRef, sendControlSignal };
 }
